@@ -102,6 +102,7 @@ class MTProtoStorageEngine:
 
         while remaining > 0:
             chunk_to_read = min(remaining, CHUNK_SIZE)
+            progressed = False
             # Fetch raw chunk directly via iter_download
             async for chunk in self.client.iter_download(
                 doc,
@@ -112,22 +113,47 @@ class MTProtoStorageEngine:
                 yield chunk
                 curr_offset += len(chunk)
                 remaining -= len(chunk)
+                progressed = True
                 if remaining <= 0:
                     break
+            if not progressed:
+                break
+
+    async def record_delete(self, bucket: str, key: str) -> int:
+        """Publishes a tombstone message to Telegram so deleted objects aren't resurrected."""
+        if not self.client:
+            raise RuntimeError("MTProto client not connected")
+        import time
+        payload = {"bucket": bucket, "key": key, "timestamp": int(time.time())}
+        caption_text = f"TGS3_DEL_V1:{json.dumps(payload)}"
+        msg = await self.client.send_message(self.channel_id, caption_text)
+        return msg.id
 
     async def export_and_pin_index(self, db_path: str, cycle: int) -> int:
         """
-        Compresses local SQLite index.db, uploads it to the storage channel, and pins it.
+        Creates an atomic SQLite backup, gzips it, uploads to storage channel, and pins it.
         """
         if not self.client:
             raise RuntimeError("MTProto client not connected")
 
+        import sqlite3
+        import time
+
+        # Atomic backup using sqlite3 backup API
+        backup_db_path = "/tmp/backup_snapshot.db"
+        src_conn = sqlite3.connect(db_path)
+        dst_conn = sqlite3.connect(backup_db_path)
+        with dst_conn:
+            src_conn.backup(dst_conn)
+        dst_conn.close()
+        src_conn.close()
+
         snapshot_path = "/tmp/index.db.gz"
-        with open(db_path, "rb") as in_f, gzip.open(snapshot_path, "wb", compresslevel=6) as out_f:
+        with open(backup_db_path, "rb") as in_f, gzip.open(snapshot_path, "wb", compresslevel=6) as out_f:
             while chunk := in_f.read(1024 * 1024):
                 out_f.write(chunk)
 
-        meta = {"type": "INDEX_SNAPSHOT", "cycle": cycle, "created_at": int(asyncio.get_event_loop().time())}
+        meta = {"type": "INDEX_SNAPSHOT", "cycle": cycle, "created_at": int(time.time())}
         caption = f"TGS3_SNAPSHOT:{json.dumps(meta)}"
 
         msg = await self.client.send_file(
@@ -137,21 +163,33 @@ class MTProtoStorageEngine:
             force_document=True
         )
         await self.client.pin_message(self.channel_id, msg.id, notify=False)
-        logger.info("Uploaded and pinned index snapshot (Msg ID: %d).", msg.id)
-        try:
-            os.remove(snapshot_path)
-        except OSError:
-            pass
+        logger.info("Uploaded and pinned index snapshot (Msg ID: %d, Cycle %d).", msg.id, cycle)
+        for p in (backup_db_path, snapshot_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         return msg.id
 
     async def catchup_index_from_channel(self, target_db_path: str) -> None:
         """
         Fast-Boot:
-        1. Finds pinned index.db.gz snapshot and downloads it.
-        2. Queries messages created after snapshot to replay delta self-describing captions.
+        1. Ensures schema is initialized.
+        2. Finds pinned index.db.gz snapshot and downloads it.
+        3. Queries messages created after snapshot to replay delta objects and tombstones.
         """
         if not self.client:
             raise RuntimeError("MTProto client not connected")
+
+        import sqlite3
+        from tg_s3.db import SCHEMA
+
+        # Ensure directory & initialize base schema if file doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(target_db_path)), exist_ok=True)
+        if not os.path.exists(target_db_path) or os.path.getsize(target_db_path) == 0:
+            init_conn = sqlite3.connect(target_db_path)
+            init_conn.executescript(SCHEMA)
+            init_conn.close()
 
         channel = await self.client.get_entity(self.channel_id)
         pinned_msg = None
@@ -176,11 +214,15 @@ class MTProtoStorageEngine:
             logger.info("Restored baseline index snapshot from Msg ID %d", last_snap_id)
 
         # Catch up delta messages created after snapshot
-        import sqlite3
         conn = sqlite3.connect(target_db_path)
+        conn.executescript(SCHEMA) # Guarantee schema compatibility
         delta_count = 0
         async for msg in self.client.iter_messages(channel, min_id=last_snap_id, reverse=True):
-            if msg.text and msg.text.startswith("TGS3_OBJ_V1:"):
+            if not msg.text:
+                continue
+
+            # Delta Object Write
+            if msg.text.startswith("TGS3_OBJ_V1:"):
                 try:
                     payload = json.loads(msg.text[len("TGS3_OBJ_V1:"):])
                     bucket = payload["bucket"]
@@ -191,6 +233,7 @@ class MTProtoStorageEngine:
                     now = int(msg.date.timestamp())
 
                     with conn:
+                        conn.execute("INSERT OR IGNORE INTO buckets (name, created_at) VALUES (?, ?)", (bucket, now))
                         conn.execute(
                             """
                             INSERT INTO objects (bucket, key, size_bytes, etag, created_at, synced)
@@ -208,7 +251,20 @@ class MTProtoStorageEngine:
                         )
                     delta_count += 1
                 except Exception as e:
-                    logger.warning("Failed to parse delta message %d: %s", msg.id, e)
+                    logger.warning("Failed to parse delta object message %d: %s", msg.id, e)
+
+            # Delta Tombstone Delete
+            elif msg.text.startswith("TGS3_DEL_V1:"):
+                try:
+                    payload = json.loads(msg.text[len("TGS3_DEL_V1:"):])
+                    bucket = payload["bucket"]
+                    key = payload["key"]
+                    with conn:
+                        conn.execute("DELETE FROM object_parts WHERE bucket = ? AND key = ?", (bucket, key))
+                        conn.execute("DELETE FROM objects WHERE bucket = ? AND key = ?", (bucket, key))
+                    delta_count += 1
+                except Exception as e:
+                    logger.warning("Failed to parse tombstone message %d: %s", msg.id, e)
 
         conn.close()
-        logger.info("Index catchup complete: applied %d delta objects.", delta_count)
+        logger.info("Index catchup complete: applied %d delta entries.", delta_count)
