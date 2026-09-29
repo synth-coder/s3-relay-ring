@@ -11,6 +11,9 @@ on:
         description: 'Shift duration in minutes (10 for test, 320 for prod)'
         required: false
         default: '10'
+  schedule:
+    # Safety watchdog: fires every 6 hours to resurrect the ring if an unexpected runner termination occurs
+    - cron: '15 */6 * * *'
 
 jobs:
   s3-relay:
@@ -23,7 +26,7 @@ jobs:
         uses: actions/checkout@v4
 
       # =====================================================================
-      # PHASE 1: PRE-WARMING & STANDBY
+      # PHASE 1: PRE-WARMING & SYSTEM INITIALIZATION
       # =====================================================================
       - name: Phase 1 - Pre-Warm Dependencies & Local Scratch
         id: prewarm
@@ -48,12 +51,12 @@ jobs:
           pip3 install --upgrade pip
           pip3 install aiohttp telethon tgcrypto cryptg
 
-          echo "Pre-warming completed. Standby mode active (NO MTProto, NO Cloudflare)."
+          echo "Pre-warming completed cleanly."
 
       # =====================================================================
-      # PHASE 2 & 3: HANDSHAKE, INDEX RESTORE & INGRESS CUTOVER
+      # PHASE 2: ATOMIC RESTORE, S3 GATEWAY & CLOUDFLARE INGRESS
       # =====================================================================
-      - name: Phase 2 & 3 - Handshake, Index Hydration & Cloudflare Takeover
+      - name: Phase 2 - Index Hydration & Service Activation
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -64,18 +67,11 @@ jobs:
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
         run: |
           set -euo pipefail
-          echo "=== PHASE 2 & 3: State Catchup, S3 Engine & Cloudflare Ingress ==="
+          echo "=== PHASE 2: Exclusive Index Hydration & Service Activation ==="
           CYCLE="${CYCLE_COUNT:-0}"
 
-          # Standby gate for successor:
-          # If cycle > 0, wait up to 150s for predecessor's post-cutover pinned snapshot and clean exit
-          if [ "$CYCLE" -gt 0 ]; then
-            echo "Successor cycle $CYCLE waiting in standby for predecessor handover signal..."
-            # Successor waits for predecessor's clean handoff window before connecting MTProto
-            sleep 60
-          fi
-
-          # Hydrate SQLite metadata index from Telegram pinned snapshot + deltas
+          # Successor connects exclusively (predecessor is guaranteed already dead)
+          echo "Hydrating metadata index from Telegram pinned snapshot..."
           python3 -m tg_s3.cli restore --db-path /tmp/s3_db/metadata.db
 
           # Launch local aiohttp S3 Gateway on port 9000
@@ -123,9 +119,9 @@ jobs:
           fi
 
       # =====================================================================
-      # PHASE 4: ACTIVE SHIFT & SUCCESSOR HANDOVER ORCHESTRATION
+      # PHASE 3: ACTIVE SHIFT & STRICT SEQUENTIAL HANDOVER
       # =====================================================================
-      - name: Phase 4 - Active Shift & Handover Dispatch
+      - name: Phase 3 - Active Shift & Strict Sequential Handover
         env:
           NEXT_PAT: ${{ secrets.NEXT_PAT }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -138,17 +134,51 @@ jobs:
         run: |
           set -euo pipefail
           SHIFT_MINS="${TEST_HANDOVER:-10}"
-          PREWARM_LEAD=2 # Predecessor triggers successor 2m in advance for test, 5m for prod
-          WAIT_MINS=$(( SHIFT_MINS - PREWARM_LEAD ))
-          [ $WAIT_MINS -lt 1 ] && WAIT_MINS=1
-
-          echo "=== PHASE 4: Active Shift Running for ${WAIT_MINS}m before pre-warming successor ==="
-          sleep $(( WAIT_MINS * 60 ))
-
-          # Step 1: Pre-warm dispatch to successor node
           CYCLE="${CYCLE_COUNT:-0}"
           NEXT_CYCLE=$(( CYCLE + 1 ))
 
+          echo "=== PHASE 3: Active Shift Running for ${SHIFT_MINS}m ==="
+          sleep $(( SHIFT_MINS * 60 ))
+
+          # -------------------------------------------------------------
+          # Step 1: Graceful S3 Write Drain
+          # -------------------------------------------------------------
+          echo "=== [1/5] Initiating Graceful S3 Write Drain ==="
+          curl -fsS -X POST -H "Authorization: Bearer ${DRAIN_TOKEN}" http://localhost:9000/internal/drain
+          sleep 2
+
+          # -------------------------------------------------------------
+          # Step 2: Stop S3 Server Process
+          # -------------------------------------------------------------
+          echo "=== [2/5] Stopping S3 Server Process ==="
+          pkill -SIGINT -f "tg_s3.cli run" || true
+          TIMEOUT=30
+          while pgrep -f "tg_s3.cli run" > /dev/null && [ $TIMEOUT -gt 0 ]; do
+            sleep 1
+            TIMEOUT=$(( TIMEOUT - 1 ))
+          done
+          pkill -9 -f "tg_s3.cli run" 2>/dev/null || true
+
+          # -------------------------------------------------------------
+          # Step 3: Checkpoint WAL, Snapshot & Pin Index to Telegram
+          # -------------------------------------------------------------
+          echo "=== [3/5] Exporting & Pinning Index Snapshot to Telegram ==="
+          python3 -m tg_s3.cli snapshot \
+            --db-path /tmp/s3_db/metadata.db \
+            --cycle "$NEXT_CYCLE"
+
+          # -------------------------------------------------------------
+          # Step 4: Disconnect Cloudflare Tunnel & Verify Teardown
+          # -------------------------------------------------------------
+          echo "=== [4/5] Disconnecting Cloudflare Tunnel & Closing Sockets ==="
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
+          pkill -9 -f "tg_s3.cli" 2>/dev/null || true
+          sleep 3
+
+          # -------------------------------------------------------------
+          # Step 5: Strictly Dispatch Successor Workflow Run
+          # -------------------------------------------------------------
+          echo "=== [5/5] Dispatching Successor Workflow Run (Cycle $NEXT_CYCLE) ==="
           REPOS=(
             "silver-demon61/s3-relay-ring"
             "synth-coder/s3-relay-ring"
@@ -163,45 +193,36 @@ jobs:
           NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
           TARGET_REPO="${REPOS[$NEXT_INDEX]}"
 
-          echo "Dispatching successor on ${TARGET_REPO} into standby..."
-          if ! GH_TOKEN="$NEXT_PAT" gh workflow run test-tg-s3.yml \
-            --repo "$TARGET_REPO" \
-            --ref main \
-            -f cycle_count="$NEXT_CYCLE" \
-            -f test_handover="$SHIFT_MINS"; then
-            echo "::error::Successor dispatch failed! Aborting shutdown to maintain availability."
+          DISPATCH_SUCCESS=false
+          for attempt in 1 2 3 4 5; do
+            echo "Dispatch attempt $attempt/5 to $TARGET_REPO..."
+            if GH_TOKEN="$NEXT_PAT" gh workflow run test-tg-s3.yml \
+              --repo "$TARGET_REPO" \
+              --ref main \
+              -f cycle_count="$NEXT_CYCLE" \
+              -f test_handover="$SHIFT_MINS"; then
+              echo "SUCCESS: Successor dispatched on $TARGET_REPO."
+              DISPATCH_SUCCESS=true
+              break
+            fi
+            BACKOFF=$(( attempt * 5 ))
+            echo "Dispatch failed. Retrying in ${BACKOFF}s..."
+            sleep "$BACKOFF"
+          done
+
+          if [ "$DISPATCH_SUCCESS" != "true" ]; then
+            echo "::error::CRITICAL: Failed to dispatch successor after 5 attempts!"
             exit 1
           fi
 
-          echo "Successor dispatched into standby. Serving remaining active shift (${PREWARM_LEAD}m)..."
-          sleep $(( (PREWARM_LEAD * 60) - 40 ))
-
-          # Step 2: Graceful S3 Drain (Reject new writes, complete in-flight writes, flush buffer)
-          echo "=== Initiating Graceful S3 Write Drain with DRAIN_TOKEN ==="
-          curl -fsS -X POST -H "Authorization: Bearer ${DRAIN_TOKEN}" http://localhost:9000/internal/drain
-          sleep 5
-
-          # Step 3: Stop server process cleanly to release MTProto connection
-          echo "Stopping server process cleanly..."
-          pkill -SIGINT -f "tg_s3.cli run" || true
-          sleep 3
-
-          # Step 4: Snapshot metadata and pin to Telegram channel
-          echo "Pinning atomic metadata index snapshot to Telegram channel..."
-          python3 -m tg_s3.cli snapshot \
-            --db-path /tmp/s3_db/metadata.db \
-            --cycle "$NEXT_CYCLE"
-
-          # Step 5: Disconnect Cloudflare tunnel
-          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
-          echo "Cutover complete. Exiting cleanly."
+          echo "Handover complete. Predecessor shutting down cleanly."
 
       # =====================================================================
-      # PHASE 5: TEARDOWN
+      # PHASE 4: TEARDOWN CLEANUP
       # =====================================================================
-      - name: Phase 5 - Teardown
+      - name: Phase 4 - Teardown
         if: always()
         run: |
-          echo "=== PHASE 5: Teardown Cleanup ==="
+          echo "=== PHASE 4: Teardown Cleanup ==="
           sudo pkill -SIGTERM cloudflared 2>/dev/null || true
           pkill -f "tg_s3.cli" 2>/dev/null || true
