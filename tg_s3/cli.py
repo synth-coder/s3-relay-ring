@@ -70,6 +70,7 @@ async def async_main():
         db.checkpoint_wal()
         await mtproto.export_and_pin_index(args.db_path, args.cycle)
         await mtproto.disconnect()
+        logger.info("Snapshot pinned and MTProto disconnected successfully.")
         return
 
     if args.command == "restore":
@@ -78,6 +79,7 @@ async def async_main():
             sys.exit(1)
         await mtproto.catchup_index_from_channel(args.db_path)
         await mtproto.disconnect()
+        logger.info("Restore finished and MTProto disconnected successfully.")
         return
 
     if args.command == "run":
