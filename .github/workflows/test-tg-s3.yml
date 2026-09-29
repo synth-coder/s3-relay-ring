@@ -1,0 +1,192 @@
+name: Telegram S3 Rotating Relay Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      cycle_count:
+        description: 'Relay cycle counter'
+        required: false
+        default: '0'
+      test_handover:
+        description: 'Shift duration in minutes (10 for test, 320 for prod)'
+        required: false
+        default: '10'
+
+jobs:
+  s3-relay:
+    name: Run S3 Relay Node
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # =====================================================================
+      # PHASE 1: PRE-WARMING & STANDBY (5 mins before predecessor handover)
+      # =====================================================================
+      - name: Phase 1 - Pre-Warm Dependencies & Local Scratch
+        id: prewarm
+        env:
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+        run: |
+          set -euo pipefail
+          echo "=== PHASE 1: Pre-Warming System, Python MTProto & Cloudflare ==="
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            curl jq sqlite3 pigz gzip ca-certificates build-essential libssl-dev
+
+          # Install cloudflared official release
+          echo "Installing Cloudflare Tunnel daemon..."
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          rm -f /tmp/cloudflared.deb
+
+          # Setup local scratch NVMe storage
+          sudo mkdir -p /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
+          sudo chown -R runner:docker /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
+
+          # Install Python dependencies with hardware AES-NI crypto
+          pip3 install --upgrade pip
+          pip3 install aiohttp telethon tgcrypto cryptg
+
+          echo "Pre-warming completed. Standby mode active (NO MTProto, NO Cloudflare)."
+
+      # =====================================================================
+      # PHASE 2 & 3: HANDSHAKE, INDEX RESTORE & INGRESS CUTOVER
+      # =====================================================================
+      - name: Phase 2 & 3 - Handshake, Index Hydration & Cloudflare Takeover
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          TG_STORAGE_CHANNEL: ${{ secrets.TG_STORAGE_CHANNEL }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+        run: |
+          set -euo pipefail
+          echo "=== PHASE 2 & 3: State Catchup, S3 Engine & Cloudflare Ingress ==="
+          CYCLE="${CYCLE_COUNT:-0}"
+
+          # Hydrate SQLite metadata index from Telegram pinned snapshot + deltas
+          python3 -m tg_s3.cli restore --db-path /tmp/s3_db/metadata.db || true
+
+          # Launch local aiohttp S3 Gateway on port 9000
+          nohup python3 -m tg_s3.cli run \
+            --host 127.0.0.1 \
+            --port 9000 \
+            --db-path /tmp/s3_db/metadata.db \
+            --cache-dir /tmp/s3_cache \
+            --staging-dir /tmp/s3_staging > /tmp/s3_server.log 2>&1 &
+
+          # Healthcheck local S3 gateway
+          echo "Awaiting S3 Gateway localhost:9000/healthz..."
+          GATEWAY_UP=false
+          for i in {1..30}; do
+            if curl -fsS http://localhost:9000/healthz > /dev/null 2>&1; then
+              echo "S3 Gateway online on localhost:9000 (${i}s)."
+              GATEWAY_UP=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$GATEWAY_UP" != "true" ]; then
+            echo "::error::S3 Gateway failed to start!"
+            cat /tmp/s3_server.log
+            exit 1
+          fi
+
+          # Start Cloudflare Tunnel (Instant edge cutover)
+          if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            echo "Starting Cloudflare Tunnel daemon..."
+            sudo cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            sleep 3
+
+            echo "Verifying public Cloudflare S3 endpoint..."
+            for cf_chk in {1..30}; do
+              CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 2 https://s3.justsawyou.cyou/healthz || echo "000")
+              echo "Public check (${cf_chk}/30): HTTP ${CF_STATUS}"
+              if [ "$CF_STATUS" = "200" ]; then
+                echo "SUCCESS: s3.justsawyou.cyou is live and healthy!"
+                break
+              fi
+              sleep 2
+            done
+          fi
+
+      # =====================================================================
+      # PHASE 4: ACTIVE SHIFT & SUCCESSOR HANDOVER ORCHESTRATION
+      # =====================================================================
+      - name: Phase 4 - Active Shift & Handover Dispatch
+        env:
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
+          TG_STORAGE_CHANNEL: ${{ secrets.TG_STORAGE_CHANNEL }}
+          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
+          TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
+        run: |
+          set -euo pipefail
+          SHIFT_MINS="${TEST_HANDOVER:-10}"
+          PREWARM_LEAD=2 # Predecessor triggers successor 2m in advance for test, 5m for prod
+          WAIT_MINS=$(( SHIFT_MINS - PREWARM_LEAD ))
+          [ $WAIT_MINS -lt 1 ] && WAIT_MINS=1
+
+          echo "=== PHASE 4: Active Shift Running for ${WAIT_MINS}m before pre-warming successor ==="
+          sleep $(( WAIT_MINS * 60 ))
+
+          # Step 1: Pre-warm dispatch to successor node
+          CYCLE="${CYCLE_COUNT:-0}"
+          NEXT_CYCLE=$(( CYCLE + 1 ))
+
+          REPOS=(
+            "silver-demon61/coolify-test"
+            "synth-coder/coolify-test"
+          )
+          CURRENT_INDEX=0
+          for i in "${!REPOS[@]}"; do
+            if [ "${REPOS[$i]}" = "${GITHUB_REPOSITORY}" ]; then
+              CURRENT_INDEX=$i
+              break
+            fi
+          done
+          NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
+          TARGET_REPO="${REPOS[$NEXT_INDEX]}"
+
+          echo "Dispatching successor on ${TARGET_REPO} into standby..."
+          GH_TOKEN="$NEXT_PAT" gh workflow run test-tg-s3.yml \
+            --repo "$TARGET_REPO" \
+            --ref main \
+            -f cycle_count="$NEXT_CYCLE" \
+            -f test_handover="$SHIFT_MINS" || true
+
+          echo "Successor dispatched into standby. Serving remaining active shift (${PREWARM_LEAD}m)..."
+          sleep $(( (PREWARM_LEAD * 60) - 20 ))
+
+          # Step 2: Graceful S3 Drain (Reject new writes, complete in-flight writes)
+          echo "=== Initiating Graceful S3 Write Drain ==="
+          curl -s -X POST http://localhost:9000/internal/drain || true
+          sleep 10
+
+          # Step 3: Snapshot metadata and pin to Telegram channel
+          echo "Pinning metadata index snapshot to Telegram channel..."
+          python3 -m tg_s3.cli snapshot \
+            --db-path /tmp/s3_db/metadata.db \
+            --cycle "$NEXT_CYCLE"
+
+          # Step 4: Disconnect local S3 and Cloudflare tunnel
+          sudo pkill -SIGTERM cloudflared || true
+          pkill -f "tg_s3.cli run" || true
+          echo "Cutover complete. Exiting cleanly."
+
+      # =====================================================================
+      # PHASE 5: TEARDOWN
+      # =====================================================================
+      - name: Phase 5 - Teardown
+        if: always()
+        run: |
+          echo "=== PHASE 5: Teardown Cleanup ==="
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
+          pkill -f "tg_s3.cli" 2>/dev/null || true
+          sudo rm -rf /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
