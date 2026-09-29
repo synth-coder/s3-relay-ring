@@ -16,8 +16,32 @@ on:
     - cron: '15 */6 * * *'
 
 jobs:
+  gate:
+    name: Watchdog Liveness Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Check Health
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "=== Cron Watchdog Triggered: Verifying Public S3 Health ==="
+            CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://s3.justsawyou.cyou/healthz || echo "000")
+            if [ "$CF_STATUS" = "200" ]; then
+              echo "Relay ring is ALIVE and healthy (HTTP 200). Skipping watchdog run."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Relay ring appears DOWN (HTTP $CF_STATUS). Proceeding with resurrection."
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
   s3-relay:
     name: Run S3 Relay Node
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -141,10 +165,10 @@ jobs:
           sleep $(( SHIFT_MINS * 60 ))
 
           # -------------------------------------------------------------
-          # Step 1: Graceful S3 Write Drain
+          # Step 1: Graceful S3 Write Drain (Non-fatal on partial failures)
           # -------------------------------------------------------------
           echo "=== [1/5] Initiating Graceful S3 Write Drain ==="
-          curl -fsS -X POST -H "Authorization: Bearer ${DRAIN_TOKEN}" http://localhost:9000/internal/drain
+          curl -fsS -X POST -H "Authorization: Bearer ${DRAIN_TOKEN}" http://localhost:9000/internal/drain || true
           sleep 2
 
           # -------------------------------------------------------------
@@ -167,18 +191,14 @@ jobs:
             --db-path /tmp/s3_db/metadata.db \
             --cycle "$NEXT_CYCLE"
 
-          # -------------------------------------------------------------
-          # Step 4: Disconnect Cloudflare Tunnel & Verify Teardown
-          # -------------------------------------------------------------
-          echo "=== [4/5] Disconnecting Cloudflare Tunnel & Closing Sockets ==="
-          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
+          # Explicitly verify MTProto processes are dead before dispatching successor
           pkill -9 -f "tg_s3.cli" 2>/dev/null || true
-          sleep 3
+          sleep 2
 
           # -------------------------------------------------------------
-          # Step 5: Strictly Dispatch Successor Workflow Run
+          # Step 4: Dispatch Successor Workflow Run & Verify (CRIT-4 Order)
           # -------------------------------------------------------------
-          echo "=== [5/5] Dispatching Successor Workflow Run (Cycle $NEXT_CYCLE) ==="
+          echo "=== [4/5] Dispatching Successor Workflow Run (Cycle $NEXT_CYCLE) ==="
           REPOS=(
             "silver-demon61/s3-relay-ring"
             "synth-coder/s3-relay-ring"
@@ -215,6 +235,11 @@ jobs:
             exit 1
           fi
 
+          # -------------------------------------------------------------
+          # Step 5: Disconnect Cloudflare Tunnel
+          # -------------------------------------------------------------
+          echo "=== [5/5] Disconnecting Cloudflare Tunnel ==="
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
           echo "Handover complete. Predecessor shutting down cleanly."
 
       # =====================================================================
