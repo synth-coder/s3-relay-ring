@@ -39,7 +39,14 @@ class S3Server:
         self.drain_token = os.getenv("DRAIN_TOKEN", "")
 
         self.app = web.Application(client_max_size=10 * 1024 * 1024 * 1024) # 10 GB
+        self.app.on_response_prepare.append(self._on_prepare)
         self._setup_routes()
+
+    async def _on_prepare(self, request: web.Request, response: web.StreamResponse):
+        """Enforces no-cache headers on all responses (buffered and streamed) before headers reach wire."""
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
 
     def _setup_routes(self):
         # Health & Internal Handover Controls
@@ -79,12 +86,17 @@ class S3Server:
             return web.Response(status=403, text="Forbidden")
 
         self.is_draining = True
-        logger.info("DRAIN MODE ACTIVATED: Awaiting in-flight writes before flush...")
-        while self._inflight_puts > 0:
+        logger.info("DRAIN MODE ACTIVATED: Awaiting in-flight writes before flush (timeout 30s)...")
+        wait_start = time.time()
+        while self._inflight_puts > 0 and (time.time() - wait_start < 30.0):
             await asyncio.sleep(0.05)
 
-        await self.staging.flush_all_pending()
-        logger.info("DRAIN MODE: All writes completed and flushed cleanly.")
+        try:
+            await self.staging.flush_all_pending()
+        except Exception as e:
+            logger.error("Non-fatal error during drain flush: %s", e)
+
+        logger.info("DRAIN MODE: Completed cleanly.")
         return web.Response(text="DRAINING", status=200)
 
     # --- Root Handlers ---
@@ -194,9 +206,26 @@ class S3Server:
             match = re.match(r"bytes=(\d*)-(\d*)", range_header)
             if match:
                 s_str, e_str = match.groups()
-                start = int(s_str) if s_str else 0
-                end = int(e_str) if e_str else total_size - 1
-                is_range = True
+                if not s_str and e_str:
+                    # Suffix range: bytes=-500 (last 500 bytes)
+                    suffix_len = int(e_str)
+                    start = max(0, total_size - suffix_len)
+                    end = total_size - 1
+                    is_range = True
+                elif s_str:
+                    start = int(s_str)
+                    end = int(e_str) if e_str else total_size - 1
+                    is_range = True
+
+        # Validate range boundary conformance (RFC 7233)
+        if is_range:
+            if start >= total_size or start > end:
+                return web.Response(
+                    status=416,
+                    headers={"Content-Range": f"bytes */{total_size}"},
+                    text="Requested Range Not Satisfiable"
+                )
+            end = min(end, total_size - 1)
 
         content_length = (end - start) + 1
         status = 206 if is_range else 200
