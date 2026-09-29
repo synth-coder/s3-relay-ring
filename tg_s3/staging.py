@@ -7,11 +7,25 @@ Handles:
 4. Auto-eviction when local scratch space reaches threshold
 """
 import os
+import re
 import shutil
 import hashlib
 import time
 import asyncio
 from typing import Dict, Any, Optional, Callable, Awaitable, Tuple
+
+def validate_upload_id(upload_id: str) -> None:
+    if not isinstance(upload_id, str) or not re.match(r"^[0-9a-f]{24}$", upload_id):
+        raise ValueError(f"Illegal uploadId format: {upload_id}")
+
+def validate_bucket(bucket: str) -> None:
+    # AWS S3 standard bucket naming: 3-63 chars, lowercase alphanumeric, dots and hyphens, no consecutive dots
+    if (
+        not isinstance(bucket, str)
+        or not re.match(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", bucket)
+        or ".." in bucket
+    ):
+        raise ValueError(f"Illegal bucket name: {bucket}")
 
 class StagingManager:
     def __init__(
@@ -35,7 +49,7 @@ class StagingManager:
         self._debounce_tasks: Dict[str, asyncio.TimerHandle] = {}
 
     def get_cache_path(self, bucket: str, key: str) -> str:
-        # Sanitize key and verify path stays strictly within bucket cache directory
+        validate_bucket(bucket)
         bucket_dir = os.path.abspath(os.path.join(self.cache_dir, bucket))
         clean_key = os.path.normpath(key.lstrip("/"))
         target_path = os.path.abspath(os.path.join(bucket_dir, clean_key))
@@ -45,6 +59,7 @@ class StagingManager:
         return target_path
 
     def get_multipart_part_path(self, upload_id: str, part_num: int) -> str:
+        validate_upload_id(upload_id)
         path = os.path.join(self.staging_dir, upload_id, f"part_{part_num:05d}.bin")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
@@ -86,14 +101,28 @@ class StagingManager:
     async def flush_all_pending(self):
         """
         Forces immediate execution of all debounced writes before shift handover.
+        Resilient: per-item error handling so one failed upload never aborts the flush loop.
         """
+        import logging
+        from telethon.errors import FloodWaitError
+        logger = logging.getLogger("tg_s3.staging")
+
         pending = list(self._debounce_tasks.items())
         for item_id, handle in pending:
             handle.cancel()
             bucket, key = item_id.split("/", 1)
             path = self.get_cache_path(bucket, key)
             if self.sync_callback and os.path.isfile(path):
-                await self.sync_callback(bucket, key, path)
+                for attempt in range(3):
+                    try:
+                        await self.sync_callback(bucket, key, path)
+                        break
+                    except FloodWaitError as e:
+                        logger.warning("Telegram FloodWait on %s: sleeping %ds", item_id, e.seconds)
+                        await asyncio.sleep(e.seconds + 1)
+                    except Exception as e:
+                        logger.error("Error flushing debounced item %s (attempt %d): %s", item_id, attempt, e)
+                        await asyncio.sleep(1)
         self._debounce_tasks.clear()
 
     def assemble_multipart(self, upload_id: str, target_path: str) -> Tuple[int, str]:
@@ -101,6 +130,7 @@ class StagingManager:
         Aggregates all buffered parts into the target output file.
         Computes final size and MD5 ETag.
         """
+        validate_upload_id(upload_id)
         upload_dir = os.path.join(self.staging_dir, upload_id)
         if not os.path.isdir(upload_dir):
             raise FileNotFoundError(f"Upload directory for {upload_id} not found")
@@ -124,6 +154,7 @@ class StagingManager:
         return total_bytes, md5.hexdigest()
 
     def abort_multipart_staging(self, upload_id: str) -> None:
+        validate_upload_id(upload_id)
         upload_dir = os.path.join(self.staging_dir, upload_id)
         shutil.rmtree(upload_dir, ignore_errors=True)
 
