@@ -158,8 +158,12 @@ class StagingManager:
         upload_dir = os.path.join(self.staging_dir, upload_id)
         shutil.rmtree(upload_dir, ignore_errors=True)
 
-    def evict_if_needed(self):
-        """Purges oldest cached files if scratch disk exceeds max_cache_bytes."""
+    def evict_if_needed(self, is_synced_fn: Optional[Callable[[str, str], bool]] = None):
+        """
+        Purges oldest cached files if scratch disk exceeds max_cache_bytes.
+        E1 Audit Fix: Skips dirty un-synced files (synced=0) so local scratch eviction
+        never causes silent data loss of files pending Telegram upload.
+        """
         total_size = 0
         file_list = []
         for root, _, files in os.walk(self.cache_dir):
@@ -168,6 +172,13 @@ class StagingManager:
                 try:
                     stat = os.stat(fp)
                     total_size += stat.st_size
+                    rel_path = os.path.relpath(fp, self.cache_dir).replace("\\", "/")
+                    parts = rel_path.split("/", 1)
+                    if len(parts) == 2:
+                        bucket, key = parts[0], parts[1]
+                        # If callback provided and item is dirty (not synced), do not evict!
+                        if is_synced_fn and not is_synced_fn(bucket, key):
+                            continue
                     file_list.append((stat.st_mtime, stat.st_size, fp))
                 except OSError:
                     pass
