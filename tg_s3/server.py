@@ -35,6 +35,8 @@ class S3Server:
         self.access_key = access_key
         self.secret_key = secret_key
         self.is_draining = False
+        self._inflight_puts = 0
+        self.drain_token = os.getenv("DRAIN_TOKEN", "")
 
         self.app = web.Application(client_max_size=10 * 1024 * 1024 * 1024) # 10 GB
         self._setup_routes()
@@ -47,14 +49,14 @@ class S3Server:
         # S3 Root Operations
         self.app.router.add_get("/", self.handle_root_get)
 
-        # S3 Bucket & Object Operations
-        self.app.router.add_get("/{bucket}", self.handle_bucket_get)
+        # S3 Bucket & Object Operations (Note: in aiohttp add_get automatically handles HEAD unless overridden)
+        self.app.router.add_get("/{bucket}", self.handle_bucket_get, allow_head=False)
+        self.app.router.add_head("/{bucket}", self.handle_bucket_head)
         self.app.router.add_put("/{bucket}", self.handle_bucket_put)
         self.app.router.add_delete("/{bucket}", self.handle_bucket_delete)
-        self.app.router.add_head("/{bucket}", self.handle_bucket_head)
 
         # Wildcard object routes (matches any nested key)
-        self.app.router.add_get("/{bucket}/{key:.*}", self.handle_object_get)
+        self.app.router.add_get("/{bucket}/{key:.*}", self.handle_object_get, allow_head=False)
         self.app.router.add_head("/{bucket}/{key:.*}", self.handle_object_head)
         self.app.router.add_put("/{bucket}/{key:.*}", self.handle_object_put)
         self.app.router.add_post("/{bucket}/{key:.*}", self.handle_object_post)
@@ -66,9 +68,23 @@ class S3Server:
 
     async def handle_drain(self, request: web.Request) -> web.Response:
         """Toggles drain mode for pre-handover cutover."""
+        # Fix C6: Require Authorization Bearer DRAIN_TOKEN unconditionally.
+        if not self.drain_token:
+            logger.error("Drain requested but DRAIN_TOKEN is not configured!")
+            return web.Response(status=500, text="Drain Token Not Configured")
+
+        auth_header = request.headers.get("Authorization", "")
+        expected = f"Bearer {self.drain_token}"
+        if auth_header != expected:
+            return web.Response(status=403, text="Forbidden")
+
         self.is_draining = True
-        logger.info("DRAIN MODE ACTIVATED: Rejecting new S3 writes with 503 Retry-After.")
+        logger.info("DRAIN MODE ACTIVATED: Awaiting in-flight writes before flush...")
+        while self._inflight_puts > 0:
+            await asyncio.sleep(0.05)
+
         await self.staging.flush_all_pending()
+        logger.info("DRAIN MODE: All writes completed and flushed cleanly.")
         return web.Response(text="DRAINING", status=200)
 
     # --- Root Handlers ---
@@ -222,22 +238,40 @@ class S3Server:
 
     async def handle_object_put(self, request: web.Request) -> web.Response:
         """Single-shot PUT or Multipart Part Upload"""
-        if self.is_draining:
-            # Drain window gatekeeper
-            return web.Response(status=503, headers={"Retry-After": "5"}, text="Service Draining")
+        self._inflight_puts += 1
+        try:
+            if self.is_draining:
+                # Drain window gatekeeper
+                return web.Response(status=503, headers={"Retry-After": "5"}, text="Service Draining")
 
-        bucket = request.match_info["bucket"]
-        key = request.match_info["key"]
+            bucket = request.match_info["bucket"]
+            key = request.match_info["key"]
 
-        # Check if this is an S3 UploadPart: ?uploadId=...&partNumber=...
-        upload_id = request.query.get("uploadId")
-        part_num = request.query.get("partNumber")
+            # Check if this is an S3 UploadPart: ?uploadId=...&partNumber=...
+            upload_id = request.query.get("uploadId")
+            part_num = request.query.get("partNumber")
 
-        if upload_id and part_num:
-            part_path = self.staging.get_multipart_part_path(upload_id, int(part_num))
+            if upload_id and part_num:
+                part_path = self.staging.get_multipart_part_path(upload_id, int(part_num))
+                md5 = hashlib.md5()
+                total_bytes = 0
+                with open(part_path, "wb") as f:
+                    while True:
+                        chunk = await request.content.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        md5.update(chunk)
+                        total_bytes += len(chunk)
+
+                etag = md5.hexdigest()
+                return web.Response(status=200, headers={"ETag": f'"{etag}"'})
+
+            # Standard S3 PutObject
+            cache_path, f = self.staging.write_cache_stream(bucket, key)
             md5 = hashlib.md5()
             total_bytes = 0
-            with open(part_path, "wb") as f:
+            try:
                 while True:
                     chunk = await request.content.read(1024 * 1024)
                     if not chunk:
@@ -245,73 +279,63 @@ class S3Server:
                     f.write(chunk)
                     md5.update(chunk)
                     total_bytes += len(chunk)
+            finally:
+                f.close()
 
             etag = md5.hexdigest()
+            self.db.put_object(bucket, key, total_bytes, etag, synced=0)
+
+            # Schedule debounced MTProto background sync
+            self.staging.schedule_sync(bucket, key)
+
             return web.Response(status=200, headers={"ETag": f'"{etag}"'})
-
-        # Standard S3 PutObject
-        cache_path, f = self.staging.write_cache_stream(bucket, key)
-        md5 = hashlib.md5()
-        total_bytes = 0
-        try:
-            while True:
-                chunk = await request.content.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-                md5.update(chunk)
-                total_bytes += len(chunk)
         finally:
-            f.close()
-
-        etag = md5.hexdigest()
-        self.db.put_object(bucket, key, total_bytes, etag, synced=0)
-
-        # Schedule debounced MTProto background sync
-        self.staging.schedule_sync(bucket, key)
-
-        return web.Response(status=200, headers={"ETag": f'"{etag}"'})
+            self._inflight_puts -= 1
 
     async def handle_object_post(self, request: web.Request) -> web.Response:
         """Multipart Upload Control: Initiate or Complete"""
-        if self.is_draining:
-            return web.Response(status=503, headers={"Retry-After": "5"}, text="Service Draining")
+        self._inflight_puts += 1
+        try:
+            if self.is_draining:
+                return web.Response(status=503, headers={"Retry-After": "5"}, text="Service Draining")
 
-        bucket = request.match_info["bucket"]
-        key = request.match_info["key"]
+            bucket = request.match_info["bucket"]
+            key = request.match_info["key"]
 
-        # 1. InitiateMultipartUpload: ?uploads
-        if "uploads" in request.query:
-            upload_id = hashlib.sha256(f"{bucket}/{key}/{time.time()}".encode()).hexdigest()[:24]
-            self.db.initiate_multipart(upload_id, bucket, key)
-            body = f"""<?xml version="1.0" encoding="UTF-8"?>
+            # 1. InitiateMultipartUpload: ?uploads
+            if "uploads" in request.query:
+                upload_id = hashlib.sha256(f"{bucket}/{key}/{time.time()}".encode()).hexdigest()[:24]
+                self.db.initiate_multipart(upload_id, bucket, key)
+                body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
     <Bucket>{bucket}</Bucket>
     <Key>{key}</Key>
     <UploadId>{upload_id}</UploadId>
 </InitiateMultipartUploadResult>"""
-            return web.Response(text=body, content_type="application/xml")
+                return web.Response(text=body, content_type="application/xml")
 
-        # 2. CompleteMultipartUpload: ?uploadId=...
-        upload_id = request.query.get("uploadId")
-        if upload_id:
-            target_cache_path = self.staging.get_cache_path(bucket, key)
-            total_bytes, etag = self.staging.assemble_multipart(upload_id, target_cache_path)
-            self.db.put_object(bucket, key, total_bytes, etag, synced=0)
-            self.db.abort_multipart(upload_id)
+            # 2. CompleteMultipartUpload: ?uploadId=...
+            upload_id = request.query.get("uploadId")
+            if upload_id:
+                target_cache_path = self.staging.get_cache_path(bucket, key)
+                total_bytes, etag = self.staging.assemble_multipart(upload_id, target_cache_path)
+                self.db.put_object(bucket, key, total_bytes, etag, synced=0)
+                self.db.abort_multipart(upload_id)
 
-            # Schedule debounced MTProto sync
-            self.staging.schedule_sync(bucket, key)
+                # Schedule debounced MTProto sync
+                self.staging.schedule_sync(bucket, key)
 
-            body = f"""<?xml version="1.0" encoding="UTF-8"?>
+                body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
     <Bucket>{bucket}</Bucket>
     <Key>{key}</Key>
     <ETag>&quot;{etag}&quot;</ETag>
 </CompleteMultipartUploadResult>"""
-            return web.Response(text=body, content_type="application/xml")
+                return web.Response(text=body, content_type="application/xml")
 
-        return web.Response(status=400)
+            return web.Response(status=400)
+        finally:
+            self._inflight_puts -= 1
 
     async def handle_object_delete(self, request: web.Request) -> web.Response:
         bucket = request.match_info["bucket"]
@@ -328,4 +352,9 @@ class S3Server:
         cache_path = self.staging.get_cache_path(bucket, key)
         if os.path.exists(cache_path):
             os.remove(cache_path)
+
+        # Publish delete tombstone to Telegram so successors don't resurrect it
+        if self.mtproto:
+            asyncio.ensure_future(self.mtproto.record_delete(bucket, key))
+
         return web.Response(status=204)
