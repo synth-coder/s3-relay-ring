@@ -11,7 +11,7 @@ import shutil
 import hashlib
 import time
 import asyncio
-from typing import Dict, Any, Optional, Callable, Awaitable
+from typing import Dict, Any, Optional, Callable, Awaitable, Tuple
 
 class StagingManager:
     def __init__(
@@ -35,11 +35,14 @@ class StagingManager:
         self._debounce_tasks: Dict[str, asyncio.TimerHandle] = {}
 
     def get_cache_path(self, bucket: str, key: str) -> str:
-        # Sanitize key to local path
-        safe_key = key.lstrip("/").replace("../", "")
-        path = os.path.join(self.cache_dir, bucket, safe_key)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        return path
+        # Sanitize key and verify path stays strictly within bucket cache directory
+        bucket_dir = os.path.abspath(os.path.join(self.cache_dir, bucket))
+        clean_key = os.path.normpath(key.lstrip("/"))
+        target_path = os.path.abspath(os.path.join(bucket_dir, clean_key))
+        if not target_path.startswith(bucket_dir + os.sep) and target_path != bucket_dir:
+            raise ValueError(f"Illegal path traversal attempt in S3 key: {key}")
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        return target_path
 
     def get_multipart_part_path(self, upload_id: str, part_num: int) -> str:
         path = os.path.join(self.staging_dir, upload_id, f"part_{part_num:05d}.bin")
