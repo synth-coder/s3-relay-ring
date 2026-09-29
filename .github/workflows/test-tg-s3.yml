@@ -71,9 +71,9 @@ jobs:
           sudo mkdir -p /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
           sudo chown -R runner:runner /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
 
-          # Install Python dependencies with hardware AES-NI crypto
+          # Install Python dependencies with hardware AES-NI crypto (Pinned exact Telethon for MTProto internals)
           pip3 install --upgrade pip
-          pip3 install aiohttp telethon tgcrypto cryptg
+          pip3 install aiohttp telethon==1.44.0 tgcrypto cryptg
 
           echo "Pre-warming completed cleanly."
 
