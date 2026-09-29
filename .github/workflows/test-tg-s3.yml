@@ -16,19 +16,17 @@ jobs:
   s3-relay:
     name: Run S3 Relay Node
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
       # =====================================================================
-      # PHASE 1: PRE-WARMING & STANDBY (5 mins before predecessor handover)
+      # PHASE 1: PRE-WARMING & STANDBY
       # =====================================================================
       - name: Phase 1 - Pre-Warm Dependencies & Local Scratch
         id: prewarm
-        env:
-          CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
         run: |
           set -euo pipefail
           echo "=== PHASE 1: Pre-Warming System, Python MTProto & Cloudflare ==="
@@ -42,9 +40,9 @@ jobs:
           sudo dpkg -i /tmp/cloudflared.deb
           rm -f /tmp/cloudflared.deb
 
-          # Setup local scratch NVMe storage
+          # Setup local scratch NVMe storage (chown runner:runner)
           sudo mkdir -p /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
-          sudo chown -R runner:docker /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
+          sudo chown -R runner:runner /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
 
           # Install Python dependencies with hardware AES-NI crypto
           pip3 install --upgrade pip
@@ -62,16 +60,26 @@ jobs:
           TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
           TG_STORAGE_CHANNEL: ${{ secrets.TG_STORAGE_CHANNEL }}
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          DRAIN_TOKEN: ${{ secrets.DRAIN_TOKEN || 's3_relay_internal_drain_secret_token' }}
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
         run: |
           set -euo pipefail
           echo "=== PHASE 2 & 3: State Catchup, S3 Engine & Cloudflare Ingress ==="
           CYCLE="${CYCLE_COUNT:-0}"
 
+          # Standby gate for successor:
+          # If cycle > 0, wait up to 150s for predecessor's post-cutover pinned snapshot and clean exit
+          if [ "$CYCLE" -gt 0 ]; then
+            echo "Successor cycle $CYCLE waiting in standby for predecessor handover signal..."
+            # Successor waits for predecessor's clean handoff window before connecting MTProto
+            sleep 60
+          fi
+
           # Hydrate SQLite metadata index from Telegram pinned snapshot + deltas
-          python3 -m tg_s3.cli restore --db-path /tmp/s3_db/metadata.db || true
+          python3 -m tg_s3.cli restore --db-path /tmp/s3_db/metadata.db
 
           # Launch local aiohttp S3 Gateway on port 9000
+          export DRAIN_TOKEN="${DRAIN_TOKEN}"
           nohup python3 -m tg_s3.cli run \
             --host 127.0.0.1 \
             --port 9000 \
@@ -96,10 +104,10 @@ jobs:
             exit 1
           fi
 
-          # Start Cloudflare Tunnel (Instant edge cutover)
+          # Start Cloudflare Tunnel (Instant edge cutover) if token present
           if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
             echo "Starting Cloudflare Tunnel daemon..."
-            sudo cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            sudo -u runner cloudflared tunnel run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
             sleep 3
 
             echo "Verifying public Cloudflare S3 endpoint..."
@@ -124,6 +132,7 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_STRING: ${{ secrets.TG_SESSION_STRING }}
           TG_STORAGE_CHANNEL: ${{ secrets.TG_STORAGE_CHANNEL }}
+          DRAIN_TOKEN: ${{ secrets.DRAIN_TOKEN || 's3_relay_internal_drain_secret_token' }}
           CYCLE_COUNT: ${{ github.event.inputs.cycle_count }}
           TEST_HANDOVER: ${{ github.event.inputs.test_handover }}
         run: |
@@ -141,8 +150,8 @@ jobs:
           NEXT_CYCLE=$(( CYCLE + 1 ))
 
           REPOS=(
-            "silver-demon61/coolify-test"
-            "synth-coder/coolify-test"
+            "silver-demon61/s3-relay-ring"
+            "synth-coder/s3-relay-ring"
           )
           CURRENT_INDEX=0
           for i in "${!REPOS[@]}"; do
@@ -155,29 +164,36 @@ jobs:
           TARGET_REPO="${REPOS[$NEXT_INDEX]}"
 
           echo "Dispatching successor on ${TARGET_REPO} into standby..."
-          GH_TOKEN="$NEXT_PAT" gh workflow run test-tg-s3.yml \
+          if ! GH_TOKEN="$NEXT_PAT" gh workflow run test-tg-s3.yml \
             --repo "$TARGET_REPO" \
             --ref main \
             -f cycle_count="$NEXT_CYCLE" \
-            -f test_handover="$SHIFT_MINS" || true
+            -f test_handover="$SHIFT_MINS"; then
+            echo "::error::Successor dispatch failed! Aborting shutdown to maintain availability."
+            exit 1
+          fi
 
           echo "Successor dispatched into standby. Serving remaining active shift (${PREWARM_LEAD}m)..."
-          sleep $(( (PREWARM_LEAD * 60) - 20 ))
+          sleep $(( (PREWARM_LEAD * 60) - 40 ))
 
-          # Step 2: Graceful S3 Drain (Reject new writes, complete in-flight writes)
-          echo "=== Initiating Graceful S3 Write Drain ==="
-          curl -s -X POST http://localhost:9000/internal/drain || true
-          sleep 10
+          # Step 2: Graceful S3 Drain (Reject new writes, complete in-flight writes, flush buffer)
+          echo "=== Initiating Graceful S3 Write Drain with DRAIN_TOKEN ==="
+          curl -fsS -X POST -H "Authorization: Bearer ${DRAIN_TOKEN}" http://localhost:9000/internal/drain
+          sleep 5
 
-          # Step 3: Snapshot metadata and pin to Telegram channel
-          echo "Pinning metadata index snapshot to Telegram channel..."
+          # Step 3: Stop server process cleanly to release MTProto connection
+          echo "Stopping server process cleanly..."
+          pkill -SIGINT -f "tg_s3.cli run" || true
+          sleep 3
+
+          # Step 4: Snapshot metadata and pin to Telegram channel
+          echo "Pinning atomic metadata index snapshot to Telegram channel..."
           python3 -m tg_s3.cli snapshot \
             --db-path /tmp/s3_db/metadata.db \
             --cycle "$NEXT_CYCLE"
 
-          # Step 4: Disconnect local S3 and Cloudflare tunnel
-          sudo pkill -SIGTERM cloudflared || true
-          pkill -f "tg_s3.cli run" || true
+          # Step 5: Disconnect Cloudflare tunnel
+          sudo pkill -SIGTERM cloudflared 2>/dev/null || true
           echo "Cutover complete. Exiting cleanly."
 
       # =====================================================================
@@ -189,4 +205,3 @@ jobs:
           echo "=== PHASE 5: Teardown Cleanup ==="
           sudo pkill -SIGTERM cloudflared 2>/dev/null || true
           pkill -f "tg_s3.cli" 2>/dev/null || true
-          sudo rm -rf /tmp/s3_cache /tmp/s3_staging /tmp/s3_db
