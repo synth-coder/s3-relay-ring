@@ -68,21 +68,21 @@ jobs:
             fi
           }
 
-          # Check if either ring repo has in_progress or queued runs
+          # Check if either ring repo has in_progress or queued runs (excluding this current run)
           check_active_runs() {
+            local current_run_id="${GITHUB_RUN_ID}"
             local repos=("silver-demon61/s3-relay-ring" "synth-coder/s3-relay-ring")
             for r in "${repos[@]}"; do
               local count
-              # Use NEXT_PAT if available, else fallback
-              count=$(GH_TOKEN="${NEXT_PAT:-$MY_PAT}" gh run list --repo "$r" --workflow test-tg-s3.yml --status in_progress --json databaseId --jq '. | length' 2>/dev/null || echo "0")
+              count=$(GH_TOKEN="${NEXT_PAT:-$MY_PAT}" gh run list --repo "$r" --workflow test-tg-s3.yml --status in_progress --json databaseId --jq "[.[] | select(.databaseId != ($current_run_id | tonumber))] | length" 2>/dev/null || echo "0")
               if [ "$count" -gt 0 ]; then
-                echo "Detected $count in_progress run(s) on $r"
+                echo "Detected $count concurrent in_progress run(s) on $r"
                 return 0
               fi
               local qcount
-              qcount=$(GH_TOKEN="${NEXT_PAT:-$MY_PAT}" gh run list --repo "$r" --workflow test-tg-s3.yml --status queued --json databaseId --jq '. | length' 2>/dev/null || echo "0")
+              qcount=$(GH_TOKEN="${NEXT_PAT:-$MY_PAT}" gh run list --repo "$r" --workflow test-tg-s3.yml --status queued --json databaseId --jq "[.[] | select(.databaseId != ($current_run_id | tonumber))] | length" 2>/dev/null || echo "0")
               if [ "$qcount" -gt 0 ]; then
-                echo "Detected $qcount queued run(s) on $r"
+                echo "Detected $qcount concurrent queued run(s) on $r"
                 return 0
               fi
             done
