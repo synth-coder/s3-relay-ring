@@ -314,6 +314,9 @@ class S3Server:
             etag = md5.hexdigest()
             self.db.put_object(bucket, key, total_bytes, etag, synced=0)
 
+            # Evict old cached files if local scratch exceeds threshold (protects dirty un-synced files)
+            self.staging.evict_if_needed(is_synced_fn=lambda b, k: bool(self.db.get_object(b, k) and self.db.get_object(b, k).get("synced", 0) == 1))
+
             # Schedule debounced MTProto background sync
             self.staging.schedule_sync(bucket, key)
 
@@ -350,6 +353,9 @@ class S3Server:
                 total_bytes, etag = self.staging.assemble_multipart(upload_id, target_cache_path)
                 self.db.put_object(bucket, key, total_bytes, etag, synced=0)
                 self.db.abort_multipart(upload_id)
+
+                # Evict old cached files if local scratch exceeds threshold (protects dirty un-synced files)
+                self.staging.evict_if_needed(is_synced_fn=lambda b, k: bool(self.db.get_object(b, k) and self.db.get_object(b, k).get("synced", 0) == 1))
 
                 # Schedule debounced MTProto sync
                 self.staging.schedule_sync(bucket, key)
