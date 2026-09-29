@@ -11,6 +11,10 @@ on:
         description: 'Shift duration in minutes (10 for test, 320 for prod)'
         required: false
         default: '10'
+      force:
+        description: 'Set to true to override healthz gate check'
+        required: false
+        default: 'false'
   schedule:
     # Safety watchdog: fires every 6 hours to resurrect the ring if an unexpected runner termination occurs
     - cron: '15 */6 * * *'
@@ -19,23 +23,125 @@ jobs:
   gate:
     name: Watchdog Liveness Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
     outputs:
       skip: ${{ steps.check.outputs.skip }}
     steps:
-      - name: Check Health
+      - name: Check Health & Concurrency Mutex
         id: check
+        env:
+          MY_PAT: ${{ secrets.GITHUB_TOKEN }}
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
         run: |
+          CYCLE="${{ github.event.inputs.cycle_count || '0' }}"
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+          echo "Evaluating gate for event: ${{ github.event_name }}, repo: ${GITHUB_REPOSITORY}, cycle_count: ${CYCLE}, force: ${FORCE}..."
+
+          # M1: Single resurrector guard - only silver-demon61 executes scheduled watchdog
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "=== Cron Watchdog Triggered: Verifying Public S3 Health ==="
-            CF_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://s3.justsawyou.cyou/healthz || echo "000")
-            if [ "$CF_STATUS" = "200" ]; then
-              echo "Relay ring is ALIVE and healthy (HTTP 200). Skipping watchdog run."
+            if [ "${GITHUB_REPOSITORY}" != "silver-demon61/s3-relay-ring" ]; then
+              echo "Watchdog cron disabled on secondary repo ${GITHUB_REPOSITORY}. Sole watchdog is silver-demon61."
               echo "skip=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "Relay ring appears DOWN (HTTP $CF_STATUS). Proceeding with resurrection."
           fi
+
+          # Probe helper: 3x probes with 10s intervals (2/3 DOWN quorum needed to conclude DOWN)
+          probe_healthz_quorum() {
+            local up_count=0
+            for i in 1 2 3; do
+              local code
+              code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 https://s3.justsawyou.cyou/healthz || echo "000")
+              echo "  Probe $i/3 -> HTTP $code"
+              if [ "$code" = "200" ]; then
+                up_count=$(( up_count + 1 ))
+              fi
+              if [ "$i" -lt 3 ]; then
+                sleep 10
+              fi
+            done
+            # If at least 2 of 3 probes returned 200, it's ALIVE
+            if [ "$up_count" -ge 2 ]; then
+              return 0
+            else
+              return 1
+            fi
+          }
+
+          # Check if either ring repo has in_progress or queued runs
+          check_active_runs() {
+            local repos=("silver-demon61/s3-relay-ring" "synth-coder/s3-relay-ring")
+            for r in "${repos[@]}"; do
+              local count
+              # Use NEXT_PAT if available, else fallback
+              count=$(GH_TOKEN="${NEXT_PAT:-$MY_PAT}" gh run list --repo "$r" --workflow test-tg-s3.yml --status in_progress --json databaseId --jq '. | length' 2>/dev/null || echo "0")
+              if [ "$count" -gt 0 ]; then
+                echo "Detected $count in_progress run(s) on $r"
+                return 0
+              fi
+              local qcount
+              qcount=$(GH_TOKEN="${NEXT_PAT:-$MY_PAT}" gh run list --repo "$r" --workflow test-tg-s3.yml --status queued --json databaseId --jq '. | length' 2>/dev/null || echo "0")
+              if [ "$qcount" -gt 0 ]; then
+                echo "Detected $qcount queued run(s) on $r"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          # 1. Scheduled cron watchdog:
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "=== Cron Watchdog Triggered: Verifying Public S3 Health (M2 Sensor) ==="
+            if probe_healthz_quorum; then
+              echo "Relay ring is ALIVE (2/3 quorum 200). Skipping watchdog run."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Healthz probe returned DOWN. Verifying GitHub Actions active runs on both repos..."
+            if check_active_runs; then
+              echo "Relay run is actively running/queued on GitHub Actions. Suppressing resurrection."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Relay ring is truly DOWN and no runners active. Proceeding with resurrection."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2. Manual workflow_dispatch:
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "$FORCE" = "true" ]; then
+              echo "Force override active. Bypassing gate."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # M3: If cycle_count == 0 (manual launch or restart), suppress if ring is healthy
+            if [ "$CYCLE" = "0" ]; then
+              echo "=== Cycle 0 Triggered: Checking for Active Relay Conflict ==="
+              if probe_healthz_quorum; then
+                echo "::warning::Another relay node is ALREADY ACTIVE and healthy (HTTP 200). Aborting run to prevent duplicate MTProto session conflict!"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if check_active_runs; then
+                echo "::warning::Active relay runner already in progress or queued. Aborting duplicate launch!"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "Ring is inactive. Clean to start Cycle 0."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # For cycle_count > 0 dispatched by predecessor:
+            echo "Successor cycle $CYCLE proceeding."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
   s3-relay:
@@ -213,15 +319,25 @@ jobs:
           NEXT_INDEX=$(( (CURRENT_INDEX + 1) % ${#REPOS[@]} ))
           TARGET_REPO="${REPOS[$NEXT_INDEX]}"
 
+          # M4: Idempotent dispatch check before each attempt
           DISPATCH_SUCCESS=false
           for attempt in 1 2 3 4 5; do
+            echo "Checking if run for cycle $NEXT_CYCLE is already queued or running on $TARGET_REPO..."
+            EXISTING=$(GH_TOKEN="$NEXT_PAT" gh run list --repo "$TARGET_REPO" --workflow test-tg-s3.yml --status in_progress --json databaseId --jq '. | length' 2>/dev/null || echo "0")
+            EXISTING_QUEUED=$(GH_TOKEN="$NEXT_PAT" gh run list --repo "$TARGET_REPO" --workflow test-tg-s3.yml --status queued --json databaseId --jq '. | length' 2>/dev/null || echo "0")
+            if [ "$EXISTING" -gt 0 ] || [ "$EXISTING_QUEUED" -gt 0 ]; then
+              echo "SUCCESS: Successor run already exists (in_progress: $EXISTING, queued: $EXISTING_QUEUED) on $TARGET_REPO. Skipping redundant dispatch."
+              DISPATCH_SUCCESS=true
+              break
+            fi
+
             echo "Dispatch attempt $attempt/5 to $TARGET_REPO..."
             if GH_TOKEN="$NEXT_PAT" gh workflow run test-tg-s3.yml \
               --repo "$TARGET_REPO" \
               --ref main \
               -f cycle_count="$NEXT_CYCLE" \
               -f test_handover="$SHIFT_MINS"; then
-              echo "SUCCESS: Successor dispatched on $TARGET_REPO."
+              echo "SUCCESS: Successor dispatch API call succeeded on $TARGET_REPO."
               DISPATCH_SUCCESS=true
               break
             fi
