@@ -8,9 +8,9 @@ on:
         required: false
         default: '0'
       test_handover:
-        description: 'Shift duration in minutes (10 for test, 320 for prod)'
+        description: 'Shift duration in minutes (330 for prod, 10 for test)'
         required: false
-        default: '10'
+        default: '330'
       force:
         description: 'Set to true to override healthz gate check'
         required: false
@@ -71,7 +71,12 @@ jobs:
           # Check if either ring repo has in_progress or queued runs (excluding this current run)
           check_active_runs() {
             local current_run_id="${GITHUB_RUN_ID}"
-            local repos=("silver-demon61/s3-relay-ring" "synth-coder/s3-relay-ring")
+            local repos=(
+              "silver-demon61/s3-relay-ring"
+              "synth-coder/s3-relay-ring"
+              "silver-demon60/s3-relay-ring"
+              "12stack-phantom/s3-relay-ring"
+            )
             for r in "${repos[@]}"; do
               local count
               count=$(GH_TOKEN="${NEXT_PAT:-$MY_PAT}" gh run list --repo "$r" --workflow test-tg-s3.yml --status in_progress --json databaseId --jq "[.[] | select(.databaseId != ($current_run_id | tonumber))] | length" 2>/dev/null || echo "0")
@@ -308,6 +313,8 @@ jobs:
           REPOS=(
             "silver-demon61/s3-relay-ring"
             "synth-coder/s3-relay-ring"
+            "silver-demon60/s3-relay-ring"
+            "12stack-phantom/s3-relay-ring"
           )
           CURRENT_INDEX=0
           for i in "${!REPOS[@]}"; do
